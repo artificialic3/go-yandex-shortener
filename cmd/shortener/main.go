@@ -4,14 +4,16 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
 	"sync"
 )
 
-var urlDatabase = make(map[string]string)
-var mu sync.RWMutex
+var (
+	urlDatabase = make(map[string]string)
+	mutex       sync.RWMutex
+)
 
 func generateKey(length int) (string, error) {
 	bytes := make([]byte, length)
@@ -22,69 +24,70 @@ func generateKey(length int) (string, error) {
 	return hex.EncodeToString(bytes), nil
 }
 
-func generateShortURL(originalURL string) (string, error) {
-	mu.Lock()
-	defer mu.Unlock()
-	key, err := generateKey(4) // Generate a 4 byte key
+func shortenURL(originalURL string) (string, error) {
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	key, err := generateKey(4)
 	if err != nil {
 		return "", err
 	}
-	shortURL := fmt.Sprintf("/%s", key)
 	urlDatabase[key] = originalURL
-	return shortURL, nil
-}
-
-func shortenURL(w http.ResponseWriter, r *http.Request) {
-	body, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "Error reading request body", http.StatusInternalServerError)
-		return
-	}
-
-	originalURL := string(body)
-	if originalURL == "" {
-		http.Error(w, "URL is required", http.StatusBadRequest)
-		return
-	}
-
-	shortURL, err := generateShortURL(originalURL)
-	if err != nil {
-		http.Error(w, "Error generating short URL", http.StatusInternalServerError)
-		return
-	}
-
-	w.WriteHeader(http.StatusCreated)
-	fmt.Fprintf(w, "http://localhost:8080%s", shortURL)
-}
-
-func redirectURL(w http.ResponseWriter, r *http.Request) {
-	key := r.URL.Path[1:]
-	mu.RLock()
-	originalURL, ok := urlDatabase[key]
-	mu.RUnlock()
-
-	if !ok {
-		http.Error(w, "Short URL does not exist", http.StatusNotFound)
-		return
-	}
-
-	http.Redirect(w, r, originalURL, http.StatusTemporaryRedirect)
+	return key, nil
 }
 
 func handleRequests(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodPost {
-		shortenURL(w, r)
-	} else if r.Method == http.MethodGet {
-		redirectURL(w, r)
-	} else {
-		http.Error(w, "Only GET and POST methods are supported", http.StatusMethodNotAllowed)
+	switch r.Method {
+	case http.MethodPost:
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "Error reading request body", http.StatusInternalServerError)
+			return
+		}
+		defer r.Body.Close()
+
+		originalURL := string(body)
+		if originalURL == "" {
+			http.Error(w, "URL is required", http.StatusBadRequest)
+			return
+		}
+
+		key, err := shortenURL(originalURL)
+		if err != nil {
+			http.Error(w, "Error generating short URL", http.StatusInternalServerError)
+			return
+		}
+
+		shortURL := fmt.Sprintf("http://%s/%s", r.Host, key)
+
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusCreated)
+		fmt.Fprint(w, shortURL)
+
+	case http.MethodGet:
+		key := r.URL.Path[1:]
+
+		mutex.RLock()
+		originalURL, ok := urlDatabase[key]
+		mutex.RUnlock()
+
+		if !ok {
+			http.Error(w, "Short URL does not exist", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Location", originalURL)
+		w.WriteHeader(http.StatusTemporaryRedirect)
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
 func main() {
 	http.HandleFunc("/", handleRequests)
 
-	log.Println("Starting server on http://localhost:8080")
+	log.Println("Server starting on http://localhost:8080")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		log.Fatalf("Server failed to start: %v", err)
 	}
